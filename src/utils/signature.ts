@@ -18,11 +18,19 @@ function extractEmail(address: string): string {
 	return email.trim().toLowerCase();
 }
 
+/**
+ * Inline elements the Gmail signature editor lays out as blocks through CSS
+ * (typically the name in a `display:block` span). Without this they would run
+ * into the text that follows them.
+ */
+const CSS_BLOCK = /<\s*(span|a|font)\b[^>]*display\s*:\s*(?:block|list-item)[^>]*>([\s\S]*?)<\/\s*\1\s*>/gi;
+
 /** Convert a Gmail HTML signature into a reasonable plain-text equivalent. */
 export function htmlToText(html: string): string {
 	return html
+		.replace(CSS_BLOCK, '\n$2\n')
 		.replace(/<\s*br\s*\/?>/gi, '\n')
-		.replace(/<\/\s*(?:p|div|tr|h[1-6])\s*>/gi, '\n')
+		.replace(/<\/\s*(?:p|div|tr|td|th|li|ul|ol|table|blockquote|h[1-6])\s*>/gi, '\n')
 		.replace(/<[^>]+>/g, '')
 		.replace(/&nbsp;/gi, ' ')
 		.replace(/&amp;/gi, '&')
@@ -30,6 +38,7 @@ export function htmlToText(html: string): string {
 		.replace(/&gt;/gi, '>')
 		.replace(/&#0?39;/gi, '\'')
 		.replace(/&quot;/gi, '"')
+		.replace(/[ \t]+\n/g, '\n')
 		.replace(/\n{3,}/g, '\n\n')
 		.trim();
 }

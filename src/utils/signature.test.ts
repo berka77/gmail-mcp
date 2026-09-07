@@ -10,6 +10,16 @@ describe('htmlToText', () => {
 		expect(htmlToText('<div>Pontus Bergkvist<br>CTO</div>')).toBe('Pontus Bergkvist\nCTO');
 	});
 
+	it('breaks lines on inline elements styled as blocks', () => {
+		const html = '<span style="font-weight:bold;display:block">Pontus Bergkvist</span><a href="tel:+46">072 373 07 99</a>';
+		expect(htmlToText(html)).toBe('Pontus Bergkvist\n072 373 07 99');
+	});
+
+	it('puts table cells on their own lines', () => {
+		const html = '<table><tbody><tr><td><img src="logo.png"></td><td>Ponty Technology AB</td></tr></tbody></table>';
+		expect(htmlToText(html)).toBe('Ponty Technology AB');
+	});
+
 	it('decodes common HTML entities', () => {
 		expect(htmlToText('Ponty &amp; Co &lt;3 &quot;hej&quot;')).toBe('Ponty & Co <3 "hej"');
 	});
