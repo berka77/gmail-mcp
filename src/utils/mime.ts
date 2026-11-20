@@ -10,6 +10,13 @@ export const attachmentSchema = z.object({
 
 export type Attachment = z.output<typeof attachmentSchema>;
 
+/** An image the HTML body references as `cid:`; `data` is standard base64. */
+export type InlineImage = {
+	mimeType: string;
+	contentId: string; // With angle brackets, e.g. "<ii_abc123>"
+	data: string;
+};
+
 /**
  * RFC 2047 encoding for header values (e.g. Subject). Headers must be ASCII;
  * raw UTF-8 gets mojibaked by Gmail (an em dash becomes "â€”"). Values that
@@ -71,6 +78,18 @@ export function quotedPrintableEncode(text: string): string {
 	return lines.map((l) => l.replace(/ $/, '=20').replace(/\t$/, '=09')).join('\r\n');
 }
 
+/**
+ * Split base64 data into 76-char lines per RFC 2045.
+ */
+export function formatBase64(data: string): string {
+	const lines: string[] = [];
+	for (let i = 0; i < data.length; i += 76) {
+		lines.push(data.substring(i, i + 76));
+	}
+
+	return lines.join('\r\n');
+}
+
 function uniqueBoundary(prefix: string): string {
 	return `${prefix}_${Date.now()}_${Math.random().toString(36).substring(2)}`;
 }
@@ -115,10 +134,48 @@ function appendBodyPart(lines: string[], body: string, htmlBody?: string): void 
 }
 
 /**
+ * Appends the body content, wrapped in multipart/related together with the
+ * inline images when the HTML body has any, so its `cid:` references resolve.
+ */
+function appendContentPart(lines: string[], body: string, htmlBody?: string, inlineImages?: InlineImage[]): void {
+	if (!htmlBody || !inlineImages || inlineImages.length === 0) {
+		appendBodyPart(lines, body, htmlBody);
+		return;
+	}
+
+	const boundary = uniqueBoundary('related');
+	lines.push(`Content-Type: multipart/related; boundary="${boundary}"`);
+	lines.push('');
+
+	lines.push(`--${boundary}`);
+	appendBodyPart(lines, body, htmlBody);
+	lines.push('');
+
+	for (const image of inlineImages) {
+		lines.push(`--${boundary}`);
+		lines.push(`Content-Type: ${image.mimeType}`);
+		lines.push('Content-Transfer-Encoding: base64');
+		lines.push(`Content-ID: ${image.contentId}`);
+		lines.push('Content-Disposition: inline');
+		lines.push('');
+		lines.push(formatBase64(image.data));
+		lines.push('');
+	}
+
+	lines.push(`--${boundary}--`);
+}
+
+/**
  * Appends MIME multipart body with attachments to an array of RFC 2822 header lines.
  * If no attachments, appends the body part on its own.
  */
-export function appendMimeBody(lines: string[], body: string, attachments?: Attachment[], htmlBody?: string): void {
+export function appendMimeBody(
+	lines: string[],
+	body: string,
+	attachments?: Attachment[],
+	htmlBody?: string,
+	inlineImages?: InlineImage[],
+): void {
 	lines.push('MIME-Version: 1.0');
 	if (attachments && attachments.length > 0) {
 		const boundary = uniqueBoundary('boundary');
@@ -127,7 +184,7 @@ export function appendMimeBody(lines: string[], body: string, attachments?: Atta
 
 		// Body part
 		lines.push(`--${boundary}`);
-		appendBodyPart(lines, body, htmlBody);
+		appendContentPart(lines, body, htmlBody, inlineImages);
 		lines.push('');
 
 		// Attachment parts
@@ -143,6 +200,6 @@ export function appendMimeBody(lines: string[], body: string, attachments?: Atta
 
 		lines.push(`--${boundary}--`);
 	} else {
-		appendBodyPart(lines, body, htmlBody);
+		appendContentPart(lines, body, htmlBody, inlineImages);
 	}
 }

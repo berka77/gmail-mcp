@@ -5,6 +5,9 @@ import {makeGmailApiCall} from '../utils/gmail-api.js';
 import {jsonResult} from '../utils/response.js';
 import {strictSchemaWithAliases} from '../utils/schema.js';
 import {appendMimeBody, attachmentSchema, encodeHeaderValue} from '../utils/mime.js';
+import {
+	fetchAttachmentData, findAttachments, findInlineImages, getHeader, headerSchema, partSchema,
+} from '../utils/message-parts.js';
 
 const inputSchema = strictSchemaWithAliases({
 	draftId: z.string().describe('The ID of the draft to update'),
@@ -27,18 +30,36 @@ const outputSchema = z.object({
 	}).optional(),
 });
 
+const draftSchema = z.object({
+	message: z.object({
+		id: z.string(),
+		threadId: z.string().optional(),
+		payload: z.object({
+			headers: z.array(headerSchema).optional(),
+			parts: z.array(partSchema).optional(),
+		}).optional(),
+	}),
+});
+
+type CurrentDraft = z.infer<typeof draftSchema>['message'];
+
 /**
- * The thread a draft currently belongs to, or undefined if it can't be read.
- * A failed lookup must not block the update — worst case we fall back to the
- * old behaviour of letting Gmail re-thread.
+ * The draft as it is now, or undefined if it can't be read. A failed lookup
+ * must not block the update — worst case we fall back to replacing the
+ * message with exactly what the caller passed.
  */
-async function getDraftThreadId(draftId: string, token: string): Promise<string | undefined> {
+async function getCurrentDraft(draftId: string, token: string): Promise<CurrentDraft | undefined> {
 	try {
-		const draft = await makeGmailApiCall('GET', `/users/me/drafts/${draftId}?format=minimal`, token) as {message?: {threadId?: string}};
-		return draft.message?.threadId;
+		const draft = await makeGmailApiCall('GET', `/users/me/drafts/${draftId}?format=full`, token);
+		return draftSchema.parse(draft).message;
 	} catch {
 		return undefined;
 	}
+}
+
+/** Whether the HTML body references this Content-ID (given with angle brackets). */
+function referencesContentId(htmlBody: string, contentId: string): boolean {
+	return htmlBody.includes(`cid:${contentId.replace(/^<|>$/g, '')}`);
 }
 
 export function registerDraftUpdate(server: McpServer, config: Config): void {
@@ -46,7 +67,7 @@ export function registerDraftUpdate(server: McpServer, config: Config): void {
 		'draft_update',
 		{
 			title: 'Update draft',
-			description: 'Update an existing draft',
+			description: 'Update an existing draft. Fields left out keep their current value (recipients, subject, sender, attachments); reply headers (In-Reply-To, References) are always kept, and inline images stay when the new HTML body still references them by cid:.',
 			inputSchema,
 			outputSchema,
 			annotations: {
@@ -56,24 +77,62 @@ export function registerDraftUpdate(server: McpServer, config: Config): void {
 			},
 		},
 		async ({draftId, threadId, to, subject, body, htmlBody, cc, bcc, from, attachments}) => {
+			// drafts.update replaces the whole message: anything not in the new raw
+			// message is lost. Read the current draft so the update keeps what the
+			// caller didn't mean to change.
+			const current = await getCurrentDraft(draftId, config.token);
+			const headers = current?.payload?.headers;
+			const parts = current?.payload?.parts;
+			const keep = (value: string | undefined, name: string) => value ?? getHeader(headers, name);
+
+			const inlineImages = current && htmlBody
+				? await Promise.all(findInlineImages(parts)
+					.filter((image) => referencesContentId(htmlBody, image.contentId))
+					.map(async (image) => ({
+						mimeType: image.mimeType,
+						contentId: image.contentId,
+						data: await fetchAttachmentData(current.id, image.attachmentId, config.token),
+					})))
+				: undefined;
+
+			const resolvedAttachments = attachments ?? (current
+				? await Promise.all(findAttachments(parts).map(async (attachment) => ({
+					filename: attachment.filename.replaceAll('"', ''),
+					mimeType: attachment.mimeType,
+					content: await fetchAttachmentData(current.id, attachment.attachmentId, config.token),
+				})))
+				: undefined);
+
+			const resolved = {
+				from: keep(from, 'From'),
+				to: keep(to, 'To'),
+				subject: keep(subject, 'Subject'),
+				cc: keep(cc, 'Cc'),
+				bcc: keep(bcc, 'Bcc'),
+				inReplyTo: getHeader(headers, 'In-Reply-To'),
+				references: getHeader(headers, 'References'),
+			};
+
 			const lines = [
-				...(from ? [`From: ${from}`] : []),
-				...(to ? [`To: ${to}`] : []),
-				...(subject ? [`Subject: ${encodeHeaderValue(subject)}`] : []),
-				...(cc ? [`Cc: ${cc}`] : []),
-				...(bcc ? [`Bcc: ${bcc}`] : []),
+				...(resolved.from ? [`From: ${resolved.from}`] : []),
+				...(resolved.to ? [`To: ${resolved.to}`] : []),
+				...(resolved.subject ? [`Subject: ${encodeHeaderValue(resolved.subject)}`] : []),
+				...(resolved.cc ? [`Cc: ${resolved.cc}`] : []),
+				...(resolved.bcc ? [`Bcc: ${resolved.bcc}`] : []),
+				// Without these the reply detaches from the conversation in the
+				// recipient's mail client, even though Gmail keeps it in the thread.
+				...(resolved.inReplyTo ? [`In-Reply-To: ${resolved.inReplyTo}`] : []),
+				...(resolved.references ? [`References: ${resolved.references}`] : []),
 			];
 
-			appendMimeBody(lines, body ?? '', attachments, htmlBody);
+			appendMimeBody(lines, body ?? '', resolvedAttachments, htmlBody, inlineImages);
 
 			const email = lines.join('\r\n');
 			const encodedEmail = Buffer.from(email).toString('base64url');
 
-			// drafts.update replaces the whole message, and Gmail re-threads from
-			// scratch: without an explicit message.threadId the draft is moved into
-			// a brand new thread of its own, silently detaching reply drafts from
-			// their conversation. Carry the draft's current thread over by default.
-			const resolvedThreadId = threadId ?? await getDraftThreadId(draftId, config.token);
+			// Without an explicit message.threadId Gmail re-threads from scratch and
+			// moves the draft into a brand new thread of its own.
+			const resolvedThreadId = threadId ?? current?.threadId;
 
 			const message: {raw: string; threadId?: string} = {raw: encodedEmail};
 			if (resolvedThreadId) {
